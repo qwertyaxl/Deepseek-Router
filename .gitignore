@@ -1,0 +1,23 @@
+# dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# logs and local artifacts
+*.log
+*.log.fallback
+tmp/
+.tmp/
+
+# native PoW binaries (build them locally; sources are tracked)
+native/dps-pow
+native/dps-pow.exe
+
+# OS noise
+.DS_Store
+Thumbs.db
