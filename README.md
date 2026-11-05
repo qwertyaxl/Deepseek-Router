@@ -223,12 +223,16 @@ The JS solver works out of the box. For speed, build the C++ helper:
 ```bash
 # in WSL
 cd /path/to/repo
-g++ -O3 -std=c++17 native/dps-pow.cpp -o ~/dps-router/dps-pow
+g++ -O3 -march=native -std=c++17 native/dps-pow.cpp -o ~/dps-router/dps-pow
 ```
 
 The router looks for `dps-pow.exe` beside the source/root/native folder, then
 for the WSL binary (override with `DPS_POW_WSL` / `DPS_POW_WSL_PATH`). Missing
 helper = automatic JS fallback (much slower).
+
+See [`docs/POW-ACCELERATION.md`](docs/POW-ACCELERATION.md) for the algorithm
+details, build flags, WSL path overrides and observed timings
+(~50–120 ms native vs ~11.7 s JS per solve).
 
 ## Limitations
 
