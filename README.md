@@ -19,22 +19,37 @@ OpenAI-style responses — including tool calls, so Codex can run agentically.
   `response.created`, `output_item.added`, `output_text.delta`,
   `output_item.done`, `response.completed`.
 - **Chat Completions** (`/v1/chat/completions`), streaming and non-streaming.
-- **Tool calls over a text protocol.** The web API has no native tools, so the
-  router injects the client's tool schemas into the prompt as DSML instructions
-  and parses the model's DSML blocks back into OpenAI `function_call` items.
-  Several real-world DSML variants are normalized (single-bar tags, bare
-  closers, merged parameter values, glued `workdir` tails).
+  Streaming emits proper `chat.completion.chunk` deltas terminated by
+  `data: [DONE]`. Declared `tools` are bridged exactly like on the Responses
+  path: DSML replies come back as `message.tool_calls` (non-streaming) or
+  `delta.tool_calls` (streaming) with `finish_reason: "tool_calls"`, and
+  `role: "tool"` / assistant `tool_calls` history is flattened into the web
+  prompt. `tool_choice` is accepted but ignored.
+- **Tool calls over a text protocol (both endpoints).** The web API has
+  no native tools, so the router injects the client's tool schemas into the
+  prompt as a DSML contract and parses the model's DSML blocks back into
+  OpenAI tool calls (`function_call` items on `/v1/responses`, `tool_calls` on
+  `/v1/chat/completions`). Several real-world DSML variants are normalized
+  (single-bar tags, bare closers, merged parameter values, glued `workdir`
+  tails).
 - **Sticky sessions.** One web chat session per `x-conversation-id` (default
   `default`), with `parent_message_id` chaining so the model keeps server-side
   memory within a task. Idle sessions are pruned after 20 minutes.
 - **Auto-continue.** If the web message is cut off, the router calls
-  `/api/v0/chat/continue` and merges the continuation.
+  `/api/v0/chat/continue` and merges the continuation — at most 3 continuation
+  requests within an overall wall-clock budget. If the message still never
+  reports `FINISHED`, the request fails with HTTP 502 `incomplete_completion`
+  instead of returning a silently truncated answer. Continuations share the
+  same rate-limit spacing as completions.
 - **Empty-turn recovery.** A completion with no text and no thinking triggers a
   session rotation and one retry. Streaming is buffer-first, so Codex never
-  receives an empty "completed" response.
+  receives an empty "completed" response; a turn that stays empty surfaces as
+  502 `empty_completion`.
 - **Rate-limit awareness.** DeepSeek throttling arrives as an in-band SSE hint
-  on HTTP 200 (`rate_limit_reached`). The router converts it to HTTP 429 and
-  puts the account on a cooldown instead of returning a silent empty answer.
+  on HTTP 200 (`rate_limit_reached`). The router detects it structurally (an
+  answer that merely mentions rate limits is not mistaken for a throttle),
+  converts it to HTTP 429 and puts the account on a cooldown instead of
+  returning a silent empty answer.
 - **Multi-account rotation** (`DEEPSEEK_ACCOUNTS`): round-robin, cooldown on
   429, quarantine after repeated failures. Inspect with `GET /pool`.
 - **Thinking and web search toggles** (`DEEPSEEK_THINKING_ENABLED`,
@@ -281,13 +296,30 @@ details, build flags, WSL path overrides and observed timings
 - The router sends your prompts to `chat.deepseek.com`; treat content
   accordingly.
 
+## Testing
+
+```bash
+npm test          # offline suite: DSML parser, SSE frames, handler contracts
+npm run typecheck
+npm run build
+```
+
+All tests are offline: fake clients/pools and in-memory SSE streams — no
+DeepSeek session, no credentials, no outbound requests. `node
+tests/fake-router.mjs [port]` additionally starts a standalone fake
+OpenAI-compatible router (loopback only, canned replies) for smoke-testing
+clients such as Hermes against the same wire contract without touching
+DeepSeek at all.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
 | `401 session_expired` | Session token expired — capture a fresh bearer/cookie |
 | `429 rate_limited` | Account throttled — wait for the cooldown, or add accounts |
-| Empty answers | Router rotates the session and retries; check the log |
+| `502 empty_completion` | DeepSeek returned no content even after a rotation retry — retry the turn |
+| `502 incomplete_completion` | Message never reported FINISHED within the continuation budget — retry; check the log |
+| Empty answers | Router rotates the session and retries; a persistently empty turn is now an error, not a success |
 | Codex: `Missing environment variable DS_ROUTER_KEY` | `setx DS_ROUTER_KEY ...`, open a new terminal |
 | Codex: `wire_api` error | Use `wire_api = "responses"` (chat was removed) |
 | `EADDRINUSE` | Another router instance is running on the port |

@@ -159,5 +159,3 @@ export function main(): void {
     console.log(`auth: ${config.routerApiKey ? "Bearer ROUTER_API_KEY" : "open (loopback only)"}`);
   });
 }
-
-main();

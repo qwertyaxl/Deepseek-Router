@@ -17,27 +17,52 @@ function validateMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new HttpError(400, "messages must be a non-empty array", "invalid_messages");
   }
-  return value.map((entry, index) => {
+  const out: ChatMessage[] = [];
+  value.forEach((entry, index) => {
     if (!entry || typeof entry !== "object") {
       throw new HttpError(400, `messages[${index}] must be an object`, "invalid_messages");
     }
-    const { role, content } = entry as Record<string, unknown>;
+    const record = entry as Record<string, unknown>;
+    const role = record.role;
+
+    // OpenAI tool protocol: an assistant turn may carry tool_calls, and each
+    // tool turn answers one of them by tool_call_id. Flatten both into text so
+    // the web prompt keeps the full call/result transcript.
+    if (role === "tool") {
+      const toolCallId = typeof record.tool_call_id === "string" ? record.tool_call_id : "";
+      const content = typeof record.content === "string" ? record.content : JSON.stringify(record.content ?? "");
+      out.push({
+        role: "assistant",
+        content: `[Tool result${toolCallId ? ` for ${toolCallId}` : ""}]\n${content.slice(0, 8000)}`,
+      });
+      return;
+    }
     if (role !== "system" && role !== "user" && role !== "assistant") {
       throw new HttpError(
         400,
-        `messages[${index}].role must be system, user, or assistant`,
+        `messages[${index}].role must be system, user, assistant, or tool`,
         "unsupported_message_role",
       );
     }
-    if (typeof content !== "string") {
+    let content = typeof record.content === "string" ? record.content : "";
+    if (role === "assistant" && Array.isArray(record.tool_calls)) {
+      const calls = (record.tool_calls as Record<string, unknown>[]).map((call) => {
+        const fn = (call?.function ?? {}) as Record<string, unknown>;
+        const args = typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? {});
+        return `[Tool call: ${String(fn.name ?? "tool")}(${args.slice(0, 2000)})]`;
+      });
+      content = [content, ...calls].filter(Boolean).join("\n");
+    }
+    if (typeof record.content !== "string" && !(role === "assistant" && Array.isArray(record.tool_calls))) {
       throw new HttpError(
         400,
         `messages[${index}].content must be a string`,
         "unsupported_content_type",
       );
     }
-    return { role, content };
+    out.push({ role, content });
   });
+  return out;
 }
 
 /** Flatten the conversation into DeepSeek web's single prompt string. */
@@ -60,20 +85,50 @@ export function buildPrompt(messages: ChatMessage[]): string {
   return `${head}\n\n[...middle of the conversation truncated; recent context follows...]\n\n${tail}`;
 }
 
+/**
+ * DSML tool contract shared by both endpoints. Clients like Hermes/Codex
+ * always declare tools; DeepSeek web cannot execute functions natively, so the
+ * schemas are injected into the prompt and the model answers with DSML blocks
+ * that the router parses back into structured tool calls.
+ */
+export function buildToolSystemPrompt(tools: unknown[]): string {
+  const defs = tools
+    .map((tool) => {
+      const fn = ((tool ?? {}) as Record<string, unknown>).function ?? tool;
+      const record = (fn ?? {}) as Record<string, unknown>;
+      const name = String(record.name ?? "tool");
+      const params = JSON.stringify(record.parameters ?? {});
+      return `- ${name}: args JSON schema ${params}`;
+    })
+    .join("\n");
+  return [
+    "You have access to the following tools in this environment:",
+    defs,
+    "",
+    "To call a tool, output EXACTLY this format and nothing else after it:",
+    "<｜｜DSML｜｜ calls>",
+    '<｜｜DSML｜｜ invoke name="TOOL_NAME">',
+    '<｜｜DSML｜｜ parameter name="PARAM">value</｜｜DSML｜｜ parameter>',
+    "</｜｜DSML｜｜ invoke>",
+    "</｜｜DSML｜｜ calls>",
+    "",
+    "Rules: emit at most one calls block per reply; parameters must match the schema names; do not wrap the block in code fences; after the block output nothing else. Wait for tool results before continuing.",
+  ].join("\n");
+}
+
 export function buildDeepSeekBody(
   input: OpenAIChatRequest,
   chatSessionId: string,
   thinking: boolean,
   parentMessageId: number | null = null,
 ): Record<string, unknown> {
-  if (input.tools !== undefined || input.tool_choice !== undefined) {
-    throw new HttpError(
-      400,
-      "DeepSeek web routing does not support tools or tool_choice",
-      "unsupported_feature",
-    );
-  }
   const messages = validateMessages(input.messages);
+  // Tool bridge: accept declared tools instead of rejecting the request.
+  // tool_choice is accepted but ignored (the model decides when to call).
+  const tools = Array.isArray(input.tools) ? input.tools : [];
+  if (tools.length > 0) {
+    messages.unshift({ role: "system", content: buildToolSystemPrompt(tools) });
+  }
   if (
     input.temperature !== undefined &&
     (typeof input.temperature !== "number" || input.temperature < 0 || input.temperature > 2)
@@ -111,9 +166,48 @@ export interface StreamDelta {
   finishReason: string | null;
 }
 
+/** Parser state: fragments are tracked individually so full-state updates can
+ * be de-duplicated against content already emitted (verified live protocol:
+ * fragment content arrives BOTH as appends and later inside full-state list
+ * updates). */
+export interface DeltaState {
+  currentFragmentIsThink: boolean;
+  lastMessageId?: number;
+  finished?: boolean;
+  /** per-fragment THINK flag, keyed by position (internal, lazily created) */
+  fragmentTypes?: boolean[];
+  /** per-fragment emitted content length (internal, lazily created) */
+  fragmentLens?: number[];
+}
+
+function ensureFragmentSlots(state: DeltaState, count: number): void {
+  state.fragmentTypes ??= [];
+  state.fragmentLens ??= [];
+  while (state.fragmentTypes.length < count) {
+    state.fragmentTypes.push(state.currentFragmentIsThink);
+    state.fragmentLens.push(0);
+  }
+}
+
+/** Emit only the not-yet-emitted suffix of a fragment's content. */
+function fragmentSuffix(
+  state: DeltaState,
+  index: number,
+  isThink: boolean,
+  full: string,
+): { text: string; thinking: string } {
+  ensureFragmentSlots(state, index + 1);
+  state.fragmentTypes![index] = isThink;
+  const prev = state.fragmentLens![index] ?? 0;
+  const suffix = full.length > prev ? full.slice(prev) : "";
+  if (full.length > prev) state.fragmentLens![index] = full.length;
+  state.currentFragmentIsThink = isThink;
+  return isThink ? { text: "", thinking: suffix } : { text: suffix, thinking: "" };
+}
+
 export function deltaFromPayload(
   raw: string,
-  state: { currentFragmentIsThink: boolean; lastMessageId?: number; finished?: boolean },
+  state: DeltaState,
 ): StreamDelta {
   let frame: Record<string, unknown>;
   try {
@@ -142,38 +236,22 @@ export function deltaFromPayload(
     if (Array.isArray(fragments)) {
       let text = "";
       let thinking = "";
-      for (const entry of fragments) {
-        if (!entry || typeof entry !== "object") continue;
+      fragments.forEach((entry, index) => {
+        if (!entry || typeof entry !== "object") return;
         const frag = entry as Record<string, unknown>;
-        if (frag.type === "THINK" && typeof frag.content === "string") thinking += frag.content;
-        if (frag.type === "RESPONSE" && typeof frag.content === "string") text += frag.content;
-        if (frag.type === "THINK" || frag.type === "RESPONSE") {
-          state.currentFragmentIsThink = frag.type === "THINK";
-        }
+        if (frag.type !== "THINK" && frag.type !== "RESPONSE") return;
+        const suffix = fragmentSuffix(state, index, frag.type === "THINK", typeof frag.content === "string" ? frag.content : "");
+        text += suffix.text;
+        thinking += suffix.thinking;
+      });
+      if (response?.status === "FINISHED") {
+        // Fully-contained answer: emit its fragments and mark the chain done.
+        state.finished = true;
+        return { text, thinking, finishReason: "stop" };
       }
-      if (response?.status === "WIP") {
-        // Stream opened with initial content (common for short answers):
-        // emit it now; subsequent bare deltas append to it.
-        return { text, thinking, finishReason: null };
-      }
-      return { text, thinking, finishReason: "stop" };
-    }
-    return { text: "", thinking: "", finishReason: null };
-  }
-
-  // New fragment appended: switches THINK/RESPONSE mode.
-  if (path === "response/fragments" && op === "APPEND" && Array.isArray(value)) {
-    for (const entry of value) {
-      if (entry && typeof entry === "object") {
-        const frag = entry as Record<string, unknown>;
-        state.currentFragmentIsThink = frag.type === "THINK";
-        if (typeof frag.content === "string" && frag.content) {
-          if (state.currentFragmentIsThink) {
-            return { text: "", thinking: frag.content, finishReason: null };
-          }
-          return { text: frag.content, thinking: "", finishReason: null };
-        }
-      }
+      // WIP (or unknown) status: the stream continues after this envelope.
+      // Emit what it already carries; subsequent deltas append to it.
+      return { text, thinking, finishReason: null };
     }
     return { text: "", thinking: "", finishReason: null };
   }
@@ -185,16 +263,78 @@ export function deltaFromPayload(
     }
     return { text: "", thinking: "", finishReason: null };
   }
+
+  if (path !== undefined) {
+    // Fragment-addressed frames (verified live protocol):
+    //   {"p":"response/fragments","o":"APPEND","v":[{type,content}, ...]}
+    //     — new fragment(s) appended after the existing ones;
+    //   {"p":"response/fragments","v":[{type,content}, ...]}   (no op)
+    //     — FULL state update: re-carries everything emitted so far, so only
+    //       the per-fragment suffix beyond what was already emitted is new;
+    //   {"p":"response/fragments/-1/content","o":"APPEND","v":"text"}
+    //     — append to the LAST fragment (-1); positive indexes may appear.
+    // Everything else (title, session, BATCH metadata, elapsed_secs, ...) is
+    // not answer text.
+    if (path === "response/fragments" && Array.isArray(value)) {
+      const appendNew = op === "APPEND";
+      let text = "";
+      let thinking = "";
+      value.forEach((entry, offset) => {
+        if (!entry || typeof entry !== "object") return;
+        const frag = entry as Record<string, unknown>;
+        if (frag.type !== "THINK" && frag.type !== "RESPONSE") return;
+        const isThink = frag.type === "THINK";
+        const content = typeof frag.content === "string" ? frag.content : "";
+        if (appendNew) {
+          ensureFragmentSlots(state, state.fragmentTypes?.length ?? 0);
+          const index = (state.fragmentTypes?.length ?? 0) + offset;
+          const suffix = fragmentSuffix(state, index, isThink, content);
+          text += suffix.text;
+          thinking += suffix.thinking;
+        } else {
+          const suffix = fragmentSuffix(state, offset, isThink, content);
+          text += suffix.text;
+          thinking += suffix.thinking;
+        }
+      });
+      return { text, thinking, finishReason: null };
+    }
+    const contentMatch = /^response\/fragments\/(-?\d+)\/content$/.exec(path);
+    if (contentMatch && op === "APPEND" && typeof value === "string" && value) {
+      state.fragmentTypes ??= [];
+      state.fragmentLens ??= [];
+      let index = Number.parseInt(contentMatch[1]!, 10);
+      if (Number.isNaN(index) || index < 0) index = Math.max(state.fragmentTypes.length - 1, 0);
+      ensureFragmentSlots(state, index + 1);
+      const isThink = state.fragmentTypes[index] ?? state.currentFragmentIsThink;
+      state.fragmentTypes[index] = isThink;
+      state.fragmentLens[index] = (state.fragmentLens[index] ?? 0) + value.length;
+      state.currentFragmentIsThink = isThink;
+      return isThink
+        ? { text: "", thinking: value, finishReason: null }
+        : { text: value, thinking: "", finishReason: null };
+    }
+    // Any other path-bearing frame is metadata.
+    return { text: "", thinking: "", finishReason: null };
+  }
+
   if (frame.event === "close") {
+    // Transport close. Not proof that a WIP message finished semantically —
+    // the collector keeps finished=false so auto-continue can pick it up.
     return { text: "", thinking: "", finishReason: "stop" };
   }
 
-  // Bare delta: {"v":"text"} — appends to the current fragment.
-  if (value === undefined || value === null || (typeof value === "object" && !Array.isArray(value))) {
-    // {"v":{...}} envelope / heartbeats carry no visible delta.
-    return { text: "", thinking: "", finishReason: null };
-  }
+  // Bare delta: {"v":"text"} — appends to the current (last) fragment. Objects
+  // here are envelopes/heartbeats with no visible delta. The append must also
+  // advance the fragment bookkeeping so later full-state updates do not
+  // re-emit this content.
   if (typeof value === "string") {
+    state.fragmentTypes ??= [];
+    state.fragmentLens ??= [];
+    const last = Math.max(state.fragmentTypes.length - 1, 0);
+    ensureFragmentSlots(state, last + 1);
+    state.fragmentTypes[last] = state.currentFragmentIsThink;
+    state.fragmentLens[last] = (state.fragmentLens[last] ?? 0) + value.length;
     if (state.currentFragmentIsThink) {
       return { text: "", thinking: value, finishReason: null };
     }
@@ -264,7 +404,10 @@ function splitMergedParamValues(args: Record<string, unknown>): void {
 
 function normalizeToolArgs(name: string, args: Record<string, unknown>): void {
   const n = name.toLowerCase();
-  if (n.includes("exec") || n.includes("shell") || n.includes("command")) {
+  // Codex's exec_command requires {cmd}; models frequently emit {command}.
+  // Only alias for exec-style tools — clients whose schema says {command}
+  // (e.g. Hermes's shell tool) must receive their declared names untouched.
+  if (n.includes("exec")) {
     if (args.cmd === undefined) {
       for (const alias of ["command", "commandline", "command_line", "line"]) {
         if (args[alias] !== undefined) {
@@ -489,6 +632,32 @@ export interface CollectedCompletion extends CompletionResult {
   finished: boolean;
   /** true when the upstream signalled a rate limit inside an HTTP 200 SSE stream */
   rateLimited?: boolean;
+  /** how many /chat/continue requests were issued while collecting */
+  continuationsUsed?: number;
+}
+
+/**
+ * DeepSeek web signals throttling as an in-band hint frame on HTTP 200:
+ *   event: hint  data: {"type":"error","content":"Messages too frequent...","finish_reason":"rate_limit_reached"}
+ * Detect it structurally so ordinary answer text that merely mentions rate
+ * limits is never mistaken for a throttle signal.
+ */
+function isRateLimitFrame(raw: string): boolean {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object") {
+      if (parsed.finish_reason === "rate_limit_reached") return true;
+      return (
+        parsed.type === "error" &&
+        typeof parsed.content === "string" &&
+        /rate limit|too frequent/i.test(parsed.content)
+      );
+    }
+    return false;
+  } catch {
+    // Not JSON: only a bare line matching the known error payload counts.
+    return raw.includes("rate_limit_reached") || /Messages too frequent/i.test(raw);
+  }
 }
 
 export async function collectSseText(
@@ -511,10 +680,7 @@ export async function collectSseText(
     if (!trimmed.startsWith("data:")) return;
     const raw = trimmed.slice(5).trim();
     if (!raw || raw === "[DONE]") return;
-    // DeepSeek web signals throttling as an in-band hint frame on HTTP 200:
-    //   event: hint  data: {"type":"error","content":"Messages too frequent...","finish_reason":"rate_limit_reached"}
-    // Without this the stream looks like a successful empty completion.
-    if (raw.includes("rate_limit_reached") || raw.includes("Messages too frequent")) {
+    if (isRateLimitFrame(raw)) {
       rateLimited = true;
       return;
     }
@@ -702,10 +868,8 @@ export function createDeepSeekClient(
 
   let currentBody: Record<string, unknown> | undefined;
 
-  async function rawCompletion(body: Record<string, unknown>): Promise<Response> {
-    currentBody = body;
-    const powResponse = await session.solveFor(completionPath);
-    const headers = {
+  function webHeaders(powResponse: string): Record<string, string> {
+    return {
       ...(config.bearerToken ? { authorization: `Bearer ${config.bearerToken}` } : {}),
       ...(config.rawCookie ? { cookie: config.rawCookie } : {}),
       "content-type": "application/json",
@@ -721,40 +885,39 @@ export function createDeepSeekClient(
       "x-client-timezone-offset": "0",
       "x-ds-pow-response": powResponse,
     };
+  }
 
+  async function rawCompletion(body: Record<string, unknown>): Promise<Response> {
+    currentBody = body;
+    const powResponse = await session.solveFor(completionPath);
     return doFetch(`${baseUrl}${completionPath}`, {
       method: "POST",
-      headers,
+      headers: webHeaders(powResponse),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(config.requestTimeoutMs),
     });
   }
 
   async function continueCompletion(chatSessionId: string, messageId: number): Promise<Response> {
-    const continuePath = "/api/v0/chat/continue";
-    const powResponse = await session.solveFor(continuePath);
-    const headers = {
-      ...(config.bearerToken ? { authorization: `Bearer ${config.bearerToken}` } : {}),
-      ...(config.rawCookie ? { cookie: config.rawCookie } : {}),
-      "content-type": "application/json",
-      accept: "*/*",
-      origin: baseUrl,
-      referer: `${baseUrl}/`,
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
-      "x-client-platform": "web",
-      "x-client-version": "2.5.0",
-      "x-client-bundle-id": "com.deepseek.chat",
-      "x-client-locale": "en_US",
-      "x-client-timezone-offset": "0",
-      "x-ds-pow-response": powResponse,
-    };
-    return doFetch(`${baseUrl}${continuePath}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ chat_session_id: chatSessionId, message_id: messageId, fallback_to_resume: true }),
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-    });
+    // Continuations share the same serialization, spacing and cooldown as
+    // completions — chain hops must not jump the rate-limiter queue.
+    const prev = chain;
+    let release: () => void = () => {};
+    chain = new Promise<void>((r) => (release = r));
+    await prev;
+    try {
+      await waitForSlot();
+      const continuePath = "/api/v0/chat/continue";
+      const powResponse = await session.solveFor(continuePath);
+      return await doFetch(`${baseUrl}${continuePath}`, {
+        method: "POST",
+        headers: webHeaders(powResponse),
+        body: JSON.stringify({ chat_session_id: chatSessionId, message_id: messageId, fallback_to_resume: true }),
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
+      });
+    } finally {
+      release();
+    }
   }
 
   return { streamCompletion, continueCompletion };
@@ -765,6 +928,17 @@ export function normalizeJsonCompletion(
   model: string,
   now: () => number = Date.now,
 ): Record<string, unknown> {
+  // DSML tool bridge: parse the model's DSML blocks into OpenAI tool_calls so
+  // agentic clients (Hermes, any OpenAI SDK) can execute them.
+  const { cleanText, toolCalls } = extractDsmlToolCalls(result.text || "");
+  const message: Record<string, unknown> = { role: "assistant", content: cleanText };
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls.map((call) => ({
+      id: call.callId,
+      type: "function",
+      function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+    }));
+  }
   return {
     id: `chatcmpl-ds-${now()}`,
     object: "chat.completion",
@@ -773,11 +947,65 @@ export function normalizeJsonCompletion(
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: result.text },
-        finish_reason: "stop",
+        message,
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
       },
     ],
   };
+}
+
+const chunkEncoder = new TextEncoder();
+
+/**
+ * Chat Completions streaming format (what Hermes/OpenAI SDKs expect):
+ * `chat.completion.chunk` deltas terminated by `data: [DONE]`. The router is
+ * buffer-first, so the whole answer — including any DSML tool calls — is known
+ * before the first chunk is emitted.
+ */
+export function chatStreamFromCollected(
+  collected: CompletionResult,
+  model: string,
+  now: () => number = Date.now,
+): ReadableStream<Uint8Array> {
+  const { cleanText, toolCalls } = extractDsmlToolCalls(collected.text || "");
+  const id = `chatcmpl-ds-${now()}`;
+  const created = Math.floor(now() / 1000);
+  const chunk = (delta: Record<string, unknown>, finishReason: string | null): Uint8Array =>
+    chunkEncoder.encode(
+      `data: ${JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{ index: 0, delta, finish_reason: finishReason }],
+      })}\n\n`,
+    );
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(chunk({ role: "assistant", content: "" }, null));
+      if (cleanText) controller.enqueue(chunk({ content: cleanText }, null));
+      toolCalls.forEach((call, index) => {
+        controller.enqueue(
+          chunk(
+            {
+              tool_calls: [
+                {
+                  index,
+                  id: call.callId,
+                  type: "function",
+                  function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+                },
+              ],
+            },
+            null,
+          ),
+        );
+      });
+      controller.enqueue(chunk({}, toolCalls.length > 0 ? "tool_calls" : "stop"));
+      controller.enqueue(chunkEncoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
 }
 
 export function newChatSessionId(): string {

@@ -4,6 +4,8 @@ import {
 
   buildDeepSeekBody,
 
+  chatStreamFromCollected,
+
   collectSseText,
 
   createDeepSeekClient,
@@ -11,6 +13,8 @@ import {
   deltaFromPayload,
 
   normalizeJsonCompletion,
+
+  type CollectedCompletion,
 
   type DeepSeekClient,
 
@@ -968,69 +972,50 @@ export async function handleChatCompletion(
 
   }
 
-  if (body.stream) {
+  // Buffer-first: collect fully (continuations, empty-turn auto-recovery,
+  // validation) before any byte reaches the client. Forwards an empty or
+  // truncated upstream never — those are real HTTP errors instead.
+  const ctx = { chatSessionId: turn.chatSessionId, turn: turn.state, conversationId };
+  let collected = await collectWithAutoContinue(upstream, deps, ctx);
 
-    // Buffer-first streaming: collect fully, run empty-turn auto-recovery, then
-    // re-emit as SSE. Forwards an empty upstream never.
-    let collected = await collectSseText(upstream.body as ReadableStream<Uint8Array>);
-
-    if (collected.rateLimited) {
-
-      deps.pool.markRateLimited(turn.state);
-
-      throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
-
-    }
-
-    if (collected.text.length === 0 && collected.thinking.length === 0) {
-
-      const rotated = await deps.pool.rotateConversation(turn.state, conversationId);
-
-      const retryBody = buildDeepSeekBody(body, rotated.chatSessionId, isThinkingModel(requestedModel, config), rotated.parentMessageId);
-
-      const retryUpstream = await client.streamCompletion(retryBody);
-
-      if (retryUpstream.ok && retryUpstream.body) {
-
-        collected = await collectSseText(retryUpstream.body as ReadableStream<Uint8Array>);
-
-      }
-
-    }
-
-    deps.pool.setLastMessageId(turn.state, conversationId, collected.lastMessageId);
-
-    return new Response(responsesStreamFromCollected(collected, requestedModel, now), {
-
-      status: 200,
-
-      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-
-    });
-
-  }
-
-  let result = await collectSseText(upstream.body as ReadableStream<Uint8Array>);
-
-  if (result.rateLimited) {
+  if (collected.rateLimited) {
     deps.pool.markRateLimited(turn.state);
     throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
   }
 
   // Empty-turn auto-recovery: rotate the web chat session once and retry.
-  if (result.text.length === 0 && result.thinking.length === 0) {
+  if (collected.text.length === 0 && collected.thinking.length === 0) {
     const rotated = await deps.pool.rotateConversation(turn.state, conversationId);
     const retryBody = buildDeepSeekBody(body, rotated.chatSessionId, isThinkingModel(requestedModel, config), rotated.parentMessageId);
     const retryUpstream = await client.streamCompletion(retryBody);
-    if (retryUpstream.ok && retryUpstream.body) {
-      result = await collectSseText(retryUpstream.body as ReadableStream<Uint8Array>);
-      deps.pool.setLastMessageId(turn.state, conversationId, result.lastMessageId);
+    if (!retryUpstream.ok || !retryUpstream.body) {
+      throw new HttpError(
+        502,
+        `DeepSeek upstream failed on empty-turn retry: HTTP ${retryUpstream.status}`,
+        "upstream_error",
+      );
+    }
+    collected = await collectWithAutoContinue(
+      retryUpstream,
+      deps,
+      { chatSessionId: rotated.chatSessionId, turn: turn.state, conversationId },
+    );
+    if (collected.rateLimited) {
+      deps.pool.markRateLimited(turn.state);
+      throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
     }
   }
 
-  deps.pool.setLastMessageId(turn.state, conversationId, result.lastMessageId);
+  assertCollectedUsable(collected, deps, ctx);
 
-  return Response.json(normalizeJsonCompletion(result, requestedModel, now));
+  if (body.stream) {
+    return new Response(chatStreamFromCollected(collected, requestedModel, now), {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    });
+  }
+
+  return Response.json(normalizeJsonCompletion(collected, requestedModel, now));
 
 }
 
@@ -1049,81 +1034,22 @@ export async function handleResponses(
   const requestedModel = resolveModel(body.model, config);
   console.error(`[handleChatCompletion] resolved=${requestedModel}`);
 
-  // Codex always declares its built-in tools (shell, apply_patch, ...).
-
-  // DeepSeek web cannot execute them, so we strip the definitions instead of
-
-  // rejecting the request — text-only chat still works and the model simply
-
-  // answers in plain text (this mirrors the venice router's "tool block" fix).
+  // Codex always declares its built-in tools (shell, apply_patch, ...) — they
+  // are bridged via the DSML contract, never executed by DeepSeek web itself.
 
   console.error(`[handleResponses] tools=${Array.isArray(body.tools) ? body.tools.length : "none"} stream=${body.stream} input_items=${Array.isArray(body.input) ? body.input.length : "str"}`);
-  void body.tool_choice;
 
   // Tool bridge: Codex declares tools in the request, but DeepSeek web cannot
-
-  // execute function calls natively. Inject the tool schemas into the prompt
-
-  // and instruct the model to answer with DSML blocks, which this router
-
-  // converts back into Responses-API function_call items.
-
-  let extraSystem = "";
-
-  const tools = Array.isArray(body.tools) ? (body.tools as Record<string, unknown>[]) : [];
-
-  if (tools.length) {
-
-    const defs = tools
-
-      .map((tool) => {
-
-        const fn = (tool.function ?? tool) as Record<string, unknown>;
-
-        const name = String(fn.name ?? "tool");
-
-        const params = JSON.stringify(fn.parameters ?? {});
-
-        return `- ${name}: args JSON schema ${params}`;
-
-      })
-
-      .join("\n");
-
-    extraSystem = [
-
-      "You have access to the following tools in this environment:",
-
-      defs,
-
-      "",
-
-      "To call a tool, output EXACTLY this format and nothing else after it:",
-
-      '<｜｜DSML｜｜ calls>',
-
-      '<｜｜DSML｜｜ invoke name="TOOL_NAME">',
-
-      '<｜｜DSML｜｜ parameter name="PARAM">value</｜｜DSML｜｜ parameter>',
-
-      '</｜｜DSML｜｜ invoke>',
-
-      '</｜｜DSML｜｜ calls>',
-
-      "",
-
-      "Rules: emit at most one calls block per reply; parameters must match the schema names; do not wrap the block in code fences; after the block output nothing else. Wait for tool results before continuing.",
-
-].join("\n");
-
-  }
+  // execute function calls natively. Tools pass through to buildDeepSeekBody,
+  // which injects the shared DSML contract as a leading system block (same
+  // builder the Chat Completions path uses — single source of truth).
+  const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : [];
+  void body.tool_choice;
 
   const chatRequest: OpenAIChatRequest = {
-
-    messages: inputToMessages(body.input, [typeof body.instructions === "string" ? body.instructions : "", extraSystem].filter(Boolean).join("\n\n")),
-
+    messages: inputToMessages(body.input, typeof body.instructions === "string" ? body.instructions : ""),
     stream: body.stream === true,
-
+    ...(tools.length ? { tools } : {}),
   };
 
   const turn = await deps.pool.pick(conversationId);
@@ -1148,141 +1074,184 @@ export async function handleResponses(
 
   }
 
-  if (body.stream === true) {
+  // Buffer-first: fully collect the upstream SSE (continuations, empty-turn
+  // recovery and validation) BEFORE anything reaches the client. Codex treats
+  // a completed response with no output items as a finished (empty) turn, so
+  // an empty upstream stream must never be forwarded as-is.
+  const ctx = { chatSessionId: turn.chatSessionId, turn: turn.state, conversationId };
+  let collected = await collectWithAutoContinue(upstream, deps, ctx);
 
-    // Buffer-first streaming: fully collect the upstream SSE so the empty-turn
-    // auto-recovery can run BEFORE anything reaches the client. Codex treats a
-    // completed response with no output items as a finished (empty) turn, so an
-    // empty upstream stream must never be forwarded as-is.
-    let collected = await collectSseText(upstream.body as ReadableStream<Uint8Array>);
-
-    if (collected.rateLimited) {
-
-      deps.pool.markRateLimited(turn.state);
-
-      throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
-
-    }
-
-    if (collected.text.length === 0 && collected.thinking.length === 0) {
-
-      const rotated = await deps.pool.rotateConversation(turn.state, conversationId);
-
-      const retryBody = buildDeepSeekBody(chatRequest, rotated.chatSessionId, isThinkingModel(requestedModel, config), rotated.parentMessageId);
-
-      const retryUpstream = await client.streamCompletion(retryBody);
-
-      if (retryUpstream.ok && retryUpstream.body) {
-
-        collected = await collectSseText(retryUpstream.body as ReadableStream<Uint8Array>);
-
-        if (collected.rateLimited) {
-
-          deps.pool.markRateLimited(turn.state);
-
-          throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
-
-        }
-
-      }
-
-    }
-
-    deps.pool.setLastMessageId(turn.state, conversationId, collected.lastMessageId);
-
-    return new Response(responsesStreamFromCollected(collected, requestedModel, now), {
-
-      status: 200,
-
-      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-
-    });
-
-  }
-
-  let result = await collectSseText(upstream.body as ReadableStream<Uint8Array>);
-
-  if (result.rateLimited) {
+  if (collected.rateLimited) {
     deps.pool.markRateLimited(turn.state);
     throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
   }
 
   // Empty-turn auto-recovery (responses path): rotate web session once and retry.
-  if (result.text.length === 0 && result.thinking.length === 0) {
+  if (collected.text.length === 0 && collected.thinking.length === 0) {
     const rotated = await deps.pool.rotateConversation(turn.state, conversationId);
     const retryBody = buildDeepSeekBody(chatRequest, rotated.chatSessionId, isThinkingModel(requestedModel, config), rotated.parentMessageId);
     const retryUpstream = await client.streamCompletion(retryBody);
-    if (retryUpstream.ok && retryUpstream.body) {
-      result = await collectSseText(retryUpstream.body as ReadableStream<Uint8Array>);
+    if (!retryUpstream.ok || !retryUpstream.body) {
+      throw new HttpError(
+        502,
+        `DeepSeek upstream failed on empty-turn retry: HTTP ${retryUpstream.status}`,
+        "upstream_error",
+      );
+    }
+    collected = await collectWithAutoContinue(
+      retryUpstream,
+      deps,
+      { chatSessionId: rotated.chatSessionId, turn: turn.state, conversationId },
+    );
+    if (collected.rateLimited) {
+      deps.pool.markRateLimited(turn.state);
+      throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
     }
   }
 
-  deps.pool.setLastMessageId(turn.state, conversationId, result.lastMessageId);
+  assertCollectedUsable(collected, deps, ctx);
+
+  if (body.stream === true) {
+    return new Response(responsesStreamFromCollected(collected, requestedModel, now), {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    });
+  }
+
+  // Non-streaming shape mirrors responsesStreamFromCollected: DSML blocks are
+  // extracted into function_call items, never left as visible text.
+  const extracted = extractDsmlToolCalls(collected.text || "");
+  const output: Record<string, unknown>[] = [];
+  if (extracted.cleanText || extracted.toolCalls.length === 0) {
+    output.push({
+      id: "msg_0",
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: extracted.cleanText, annotations: [] }],
+    });
+  }
+  for (const call of extracted.toolCalls) {
+    output.push({
+      id: call.callId,
+      type: "function_call",
+      name: call.name,
+      arguments: JSON.stringify(call.arguments),
+      call_id: call.callId,
+      status: "completed",
+    });
+  }
 
   return Response.json({
-
     id: `resp-ds-${now()}`,
-
     object: "response",
-
     status: "completed",
-
     model: requestedModel,
-
-    output: [
-
-      {
-
-        id: "msg_0",
-
-        type: "message",
-
-        status: "completed",
-
-        role: "assistant",
-
-        content: [{ type: "output_text", text: result.text, annotations: [] }],
-
-      },
-
-    ],
-
+    output,
     usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-
   });
-
 }
 
-/** Collect an upstream stream, auto-continuing truncated messages (web "Continue"). */
+/** Maximum /chat/continue requests after the initial stream (4 streams total). */
+const MAX_CONTINUATIONS = 3;
+
+/** Overall wall-clock budget for the whole collect + continue chain. */
+const CONTINUE_CHAIN_BUDGET_MS = 180_000;
+
+interface CollectContext {
+  chatSessionId: string;
+  turn: import("./accounts.js").AccountState;
+  conversationId: string;
+}
+
+/**
+ * Collect an upstream stream, auto-continuing truncated messages (web
+ * "Continue"). Shared by both endpoints and both response modes.
+ *
+ * Stops — and never loops forever — when the message reports FINISHED, when a
+ * rate limit is signalled, when a continuation fails, when no visible progress
+ * is made, after MAX_CONTINUATIONS continuation requests, or when the
+ * wall-clock budget runs out. The continuation budget is checked BEFORE sending
+ * another request, so no response is ever issued and discarded. Callers must
+ * check `finished` / `rateLimited` before treating the result as success: a
+ * truncated chain is surfaced as an error, not an answer.
+ */
 async function collectWithAutoContinue(
   upstream: Response,
-  client: DeepSeekClient,
-  chatSessionId: string,
   deps: ResponsesDeps,
-  turn: { state: import("./accounts.js").AccountState },
-  conversationId: string,
-): Promise<{ result: import("./deepseek.js").CollectedCompletion; finalStream: ReadableStream<Uint8Array> | null }> {
-  let stream = upstream.body!;
-  let merged: import("./deepseek.js").CollectedCompletion | null = null;
-  for (let hop = 0; hop < 4; hop++) {
+  ctx: CollectContext,
+): Promise<CollectedCompletion> {
+  const now = deps.now ?? Date.now;
+  const deadline = now() + CONTINUE_CHAIN_BUDGET_MS;
+  let stream = upstream.body;
+  let merged: CollectedCompletion | null = null;
+  let continuations = 0;
+
+  while (stream) {
     const partial = await collectSseText(stream);
+    stream = null;
+    // Progress = visible content, an explicit finish, or a throttle signal.
+    const hadProgress =
+      partial.text.length > 0 ||
+      partial.thinking.length > 0 ||
+      partial.finished ||
+      !!partial.rateLimited;
     merged = merged
       ? {
           text: merged.text + partial.text,
           thinking: merged.thinking + partial.thinking,
           lastMessageId: partial.lastMessageId ?? merged.lastMessageId,
           finished: partial.finished,
+          rateLimited: merged.rateLimited || partial.rateLimited,
         }
       : partial;
-    if (merged.finished || merged.lastMessageId === null) break;
-    // Message truncated: ask DeepSeek to continue it.
-    const cont = await client.continueCompletion(chatSessionId, merged.lastMessageId);
-    if (!cont.ok || !cont.body) break;
+    if (merged.finished || merged.rateLimited) break;
+    if (!hadProgress) break; // nothing to continue from; caller recovers (rotate/retry)
+    if (merged.lastMessageId === null) break; // cannot continue without a message id
+    if (continuations >= MAX_CONTINUATIONS) break; // budget checked before sending
+    if (now() >= deadline) break;
+    continuations++;
+    // Message truncated: ask DeepSeek to continue it (queued like any other call).
+    const cont = await deps.client.continueCompletion(ctx.chatSessionId, merged.lastMessageId);
+    if (!cont.ok || !cont.body) break; // caller surfaces this as an incomplete chain
     stream = cont.body;
   }
-  deps.pool.setLastMessageId(turn.state, conversationId, merged!.lastMessageId);
-  deps.pool.markSuccess(turn.state);
-  return { result: merged!, finalStream: null };
+
+  const result: CollectedCompletion = merged ?? {
+    text: "",
+    thinking: "",
+    lastMessageId: null,
+    finished: false,
+  };
+  return { ...result, continuationsUsed: continuations };
+}
+
+/**
+ * Shared post-collection validation: turn a collected completion into either a
+ * success for the caller or a thrown HttpError. Never reports an empty turn or
+ * a truncated chain as a successful completion.
+ */
+function assertCollectedUsable(
+  collected: CollectedCompletion,
+  deps: ResponsesDeps,
+  ctx: CollectContext,
+): void {
+  if (collected.rateLimited) {
+    deps.pool.markRateLimited(ctx.turn);
+    throw new HttpError(429, "DeepSeek web throttled this account (rate_limit_reached)", "rate_limited");
+  }
+  if (collected.text.length === 0 && collected.thinking.length === 0) {
+    throw new HttpError(502, "DeepSeek web returned an empty completion", "empty_completion");
+  }
+  if (!collected.finished) {
+    throw new HttpError(
+      502,
+      `DeepSeek web message did not finish after ${collected.continuationsUsed ?? 0} continuation(s)`,
+      "incomplete_completion",
+    );
+  }
+  deps.pool.setLastMessageId(ctx.turn, ctx.conversationId, collected.lastMessageId);
+  deps.pool.markSuccess(ctx.turn);
 }
 
 export function createDeps(
